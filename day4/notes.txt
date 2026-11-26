@@ -1,0 +1,263 @@
+# Day 3 — Structured JSON Output with Pydantic
+
+**Date:** 2026-11-23  
+**What I learned:** How to force an LLM to return valid JSON, validate it with Pydantic, and use it as typed Python objects instead of raw strings.
+
+---
+
+## 1. The Problem
+
+LLMs naturally generate free-form text. If you ask for a customer's name, email, and issue, the model might reply with:
+
+```
+Sure! Here is the info: Name is Ashish, email is abc@gmail.com, and the issue is an iPhone that is not working.
+```
+
+That is hard to use programmatically. You want clean, machine-readable data:
+
+```json
+{
+  "name": "Ashish",
+  "email": "abc@gmail.com",
+  "issue": "iPhone not working"
+}
+```
+
+The solution is two layers:
+1. **Prompt engineering** — tell the model exactly what JSON shape to produce.
+2. **Validation** — parse the model's output with Pydantic so you get typed Python objects (and errors if the JSON is broken).
+
+---
+
+## 2. The Building Blocks
+
+### Pydantic `BaseModel`
+
+Pydantic lets you declare a data schema in Python:
+
+```python
+from pydantic import BaseModel
+
+class Ticket(BaseModel):
+    name: str
+    email: str
+    issue: str
+```
+
+This says: a valid `Ticket` must have three string fields. Pydantic will enforce this when you create `Ticket(...)`.
+
+### JSON Schema from Pydantic
+
+```python
+schema = Ticket.model_json_schema()
+```
+
+This turns your Python class into a JSON Schema dictionary that the LLM can read. It looks roughly like:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "name": {"type": "string"},
+    "email": {"type": "string"},
+    "issue": {"type": "string"}
+  },
+  "required": ["name", "email", "issue"]
+}
+```
+
+### Groq JSON Mode
+
+```python
+response_format = {"type": "json_object"}
+```
+
+This tells Groq: "Return only valid JSON, no markdown fences, no conversational text." Without this, the model might wrap the JSON in ```json ... ``` blocks or add sentences before/after, which breaks `json.loads()`.
+
+---
+
+## 3. Full Code Walkthrough
+
+### Setup the client
+
+```python
+import os
+from dotenv import load_dotenv
+from groq import Groq
+
+load_dotenv()
+my_api_key = os.getenv("GROQ_API_KEY")
+client = Groq(api_key=my_api_key)
+```
+
+Standard boilerplate: load your API key from `.env` and initialize the Groq client.
+
+### Define the schema
+
+```python
+from pydantic import BaseModel
+
+class Ticket(BaseModel):
+    name: str
+    email: str
+    issue: str
+
+schema = Ticket.model_json_schema()
+```
+
+### Build the system prompt
+
+```python
+system_prompt = f"""Extract the personal information from the ticket strictly based on this schema and give me a json output. {schema}"""
+message_system = {"role": "system", "content": system_prompt}
+```
+
+**Why this works:** The schema is embedded directly in the instructions. The model sees the exact keys and types it must output.
+
+### Send the user message
+
+```python
+text = "Hello My name is Ashish. I have an iphone which is not working at all. My address is delhi. My contact number is 914256955. My email is abc@gmail.com. My father is very angry, please help"
+prompt = f"""This is a customer ticket. Please extract personal information from this.\n{text}"""
+message = {"role": "user", "content": prompt}
+messages = [message_system, message]
+```
+
+### Call the model
+
+```python
+model = "openai/gpt-oss-120b"
+response = client.chat.completions.create(
+    model=model,
+    messages=messages,
+    response_format=response_format
+)
+answer = response.choices[0].message.content
+```
+
+Because `response_format` is set, `answer` should be raw JSON text like:
+
+```json
+{"name": "Ashish", "email": "abc@gmail.com", "issue": "iPhone not working"}
+```
+
+### Parse and validate
+
+```python
+import json
+
+data_file = json.loads(answer)          # string -> Python dict
+ticket = Ticket(**data_file)            # dict -> Pydantic object
+
+print(ticket.name)   # Ashish
+print(ticket.email)  # abc@gmail.com
+print(ticket.issue)  # iPhone not working
+```
+
+`Ticket(**data_file)` unpacks the dictionary into keyword arguments. If the JSON is missing a field or has the wrong type, Pydantic raises a validation error — you catch bad data early instead of getting `KeyError` later.
+
+---
+
+## 4. The Data Flow
+
+```
+Raw ticket text
+      |
+      v
+[System prompt with JSON schema] + [User text]
+      |
+      v
+Groq model (response_format=json_object)
+      |
+      v
+JSON string
+      |
+      v
+json.loads()  -->  Python dict
+      |
+      v
+Ticket(**dict) --> Pydantic object (typed, validated)
+      |
+      v
+ticket.name, ticket.email, ticket.issue
+```
+
+---
+
+## 5. Reusable Template
+
+Copy this for any structured extraction task:
+
+```python
+import json
+import os
+from dotenv import load_dotenv
+from groq import Groq
+from pydantic import BaseModel
+
+load_dotenv()
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# 1. Define your output shape
+class MyOutput(BaseModel):
+    field_one: str
+    field_two: int
+
+# 2. Turn it into JSON Schema
+schema = MyOutput.model_json_schema()
+
+# 3. Prompt the model
+system_prompt = f"Extract information strictly based on this schema and return JSON: {schema}"
+response_format = {"type": "json_object"}
+
+response = client.chat.completions.create(
+    model="openai/gpt-oss-120b",
+    messages=[
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Your input text here"},
+    ],
+    response_format=response_format,
+)
+
+# 4. Parse and validate
+raw = response.choices[0].message.content
+data = json.loads(raw)
+obj = MyOutput(**data)
+
+# 5. Use typed fields
+print(obj.field_one)
+```
+
+---
+
+## 6. Common Mistakes to Avoid
+
+| Mistake | Why it breaks | Fix |
+|---------|---------------|-----|
+| Forgetting `response_format` | Model returns markdown or conversational text | Always set `{"type": "json_object"}` |
+| Putting schema only in the user prompt | System prompt carries more weight | Embed schema in the system message |
+| Skipping Pydantic validation | Bad JSON crashes later with `KeyError` | Always wrap in `Ticket(**data)` |
+| Using `json.loads()` on markdown-wrapped output | `json.loads` fails on ```json fences | Ensure `response_format` is set, or strip fences manually |
+
+---
+
+## 7. Practice Ideas
+
+1. **Extend `Ticket`** — add fields like `priority: str`, `category: str`, `urgency: int`.
+2. **Build a batch extractor** — read multiple tickets from a file, extract each one, save results to a list.
+3. **Add error handling** — wrap `Ticket(**data)` in `try/except` to handle invalid model output gracefully.
+4. **Change the model** — try a different Groq model and compare how well it follows the schema.
+
+---
+
+## 8. Today's Git Step
+
+If today is your next day folder:
+
+```bash
+git add day3/
+git commit -m "Day 3 (2026-11-23): structured JSON output with Pydantic"
+git push origin main
+```
+
+Remember: stage only today's folder, never `git add -A`, and never `--amend` after pushing.
